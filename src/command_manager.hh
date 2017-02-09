@@ -8,6 +8,7 @@
 #include "shell_manager.hh"
 #include "parameters_parser.hh"
 #include "string.hh"
+#include "optional.hh"
 #include "utils.hh"
 #include "unordered_map.hh"
 
@@ -38,7 +39,7 @@ enum class CommandFlags
 
 template<> struct WithBitOps<CommandFlags> : std::true_type {};
 
-using CommandInfo = std::pair<String, String>;
+struct CommandInfo { String name, info; };
 
 struct Token
 {
@@ -91,8 +92,8 @@ public:
                          CommandParameters params,
                          size_t token_to_complete, ByteCount pos_in_token);
 
-    CommandInfo command_info(const Context& context,
-                             StringView command_line) const;
+    Optional<CommandInfo> command_info(const Context& context,
+                                       StringView command_line) const;
 
     bool command_defined(const String& command_name) const;
 
@@ -111,7 +112,7 @@ private:
     void execute_single_command(CommandParameters params,
                                 Context& context,
                                 const ShellContext& shell_context,
-                                DisplayCoord pos) const;
+                                DisplayCoord pos);
 
     struct CommandDescriptor
     {
@@ -125,6 +126,7 @@ private:
     using CommandMap = UnorderedMap<String, CommandDescriptor, MemoryDomain::Commands>;
     CommandMap m_commands;
     String m_last_complete_command;
+    int m_command_depth = 0;
 
     CommandMap::const_iterator find_command(const Context& context,
                                             const String& name) const;

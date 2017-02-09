@@ -46,7 +46,7 @@ static ParsedLines parse_lines(StringView data)
     while (pos < data.end())
     {
         const char* eol = std::find(pos, data.end(), '\n');
-        res.lines.emplace_back(StringData::create({pos, eol - (crlf and eol != data.end() ? 1 : 0)}, '\n'));
+        res.lines.emplace_back(StringData::create({{pos, eol - (crlf and eol != data.end() ? 1 : 0)}, "\n"}));
         pos = eol + 1;
     }
 
@@ -76,7 +76,7 @@ Buffer::Buffer(String name, Flags flags, StringView data,
     ParsedLines parsed_lines = parse_lines(data);
 
     if (parsed_lines.lines.empty())
-        parsed_lines.lines.emplace_back(StringData::create("\n"));
+        parsed_lines.lines.emplace_back(StringData::create({"\n"}));
 
     #ifdef KAK_DEBUG
     for (auto& line : parsed_lines.lines)
@@ -212,7 +212,7 @@ struct Buffer::Modification
 {
     enum Type { Insert, Erase };
 
-    Type      type;
+    Type type;
     BufferCoord coord;
     StringDataPtr content;
 
@@ -230,7 +230,7 @@ void Buffer::reload(StringView data, timespec fs_timestamp)
     ParsedLines parsed_lines = parse_lines(data);
 
     if (parsed_lines.lines.empty())
-        parsed_lines.lines.emplace_back(StringData::create("\n"));
+        parsed_lines.lines.emplace_back(StringData::create({"\n"}));
 
     const bool record_undo = not (m_flags & Flags::NoUndo);
 
@@ -249,7 +249,7 @@ void Buffer::reload(StringView data, timespec fs_timestamp)
         auto diff = find_diff(m_lines.begin(), m_lines.size(),
                               parsed_lines.lines.begin(), (int)parsed_lines.lines.size(),
                               [](const StringDataPtr& lhs, const StringDataPtr& rhs)
-                              { return lhs->hash == rhs->hash and lhs->strview() == rhs->strview(); });
+                              { return lhs->strview() == rhs->strview(); });
 
         auto it = m_lines.begin();
         for (auto& d : diff)
@@ -470,13 +470,13 @@ BufferCoord Buffer::do_insert(BufferCoord pos, StringView content)
         }
     }
     if (start == 0)
-        new_lines.push_back(StringData::create(prefix + content + suffix));
+        new_lines.push_back(StringData::create({prefix, content, suffix}));
     else if (start != content.length() or not suffix.empty())
-        new_lines.push_back(StringData::create(content.substr(start) + suffix));
+        new_lines.push_back(StringData::create({content.substr(start), suffix}));
 
     auto line_it = m_lines.begin() + (int)pos.line;
     auto new_lines_it = new_lines.begin();
-    if (not append_lines)
+    if (not append_lines) // replace first line with new first line
         *line_it++ = std::move(*new_lines_it++);
 
     m_lines.insert(line_it,
@@ -484,7 +484,8 @@ BufferCoord Buffer::do_insert(BufferCoord pos, StringView content)
                    std::make_move_iterator(new_lines.end()));
 
     const LineCount last_line = pos.line + new_lines.size() - 1;
-    const BufferCoord end = BufferCoord{ last_line, m_lines[last_line].length() - suffix.length() };
+    const auto end = at_end ? line_count()
+                            : BufferCoord{ last_line, m_lines[last_line].length() - suffix.length() };
 
     m_changes.push_back({ Change::Insert, at_end, pos, end });
     return pos;
@@ -496,13 +497,13 @@ BufferCoord Buffer::do_erase(BufferCoord begin, BufferCoord end)
     kak_assert(is_valid(end));
     StringView prefix = m_lines[begin.line].substr(0, begin.column);
     StringView suffix = m_lines[end.line].substr(end.column);
-    String new_line = prefix + suffix;
 
     BufferCoord next;
-    if (new_line.length() != 0)
+    if (not prefix.empty() or not suffix.empty())
     {
+        auto new_line = StringData::create({prefix, suffix});
         m_lines.erase(m_lines.begin() + (int)begin.line, m_lines.begin() + (int)end.line);
-        m_lines.get_storage(begin.line) = StringData::create(new_line);
+        m_lines.get_storage(begin.line) = std::move(new_line);
         next = begin;
     }
     else

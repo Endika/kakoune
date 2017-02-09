@@ -1,6 +1,5 @@
 debug ?= yes
 static ?= no
-pedantic ?= yes
 
 ifeq ($(debug),yes)
     CPPFLAGS += -DKAK_DEBUG
@@ -12,10 +11,6 @@ else
     else
         $(error debug should be either yes or no)
     endif
-endif
-
-ifeq ($(pedantic),yes)
-    CXXFLAGS += -pedantic
 endif
 
 sources := $(wildcard *.cc)
@@ -38,8 +33,8 @@ os := $(shell uname)
 
 ifeq ($(os),Darwin)
     LIBS += -lncurses -lboost_regex-mt
-    CPPFLAGS += -I/usr/local/opt/ncurses/include
-    LDFLAGS += -L/usr/local/opt/ncurses/lib
+    CPPFLAGS += -I$(PREFIX)/opt/ncurses/include -I$(PREFIX)/opt/boost/include
+    LDFLAGS += -L$(PREFIX)/opt/ncurses/lib -L$(PREFIX)/opt/boost/lib
 else ifeq ($(os),FreeBSD)
     LIBS += -ltinfow -lncursesw -lboost_regex
     CPPFLAGS += -I/usr/local/include
@@ -64,7 +59,7 @@ ifeq ($(static),yes)
     LDFLAGS += -static -pthread
 endif
 
-CXXFLAGS += -std=gnu++11 -g -Wall -Wno-reorder -Wno-sign-compare -Wno-address
+CXXFLAGS += -pedantic -std=gnu++11 -g -Wall -Wextra -Wno-unused-parameter -Wno-reorder -Wno-sign-compare -Wno-address
 
 all : kak
 kak : $(objects)

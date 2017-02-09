@@ -8,6 +8,7 @@
 #include "event_manager.hh"
 #include "file.hh"
 #include "id_map.hh"
+#include "optional.hh"
 #include "user_interface.hh"
 
 #include <sys/types.h>
@@ -102,6 +103,14 @@ public:
         }
     }
 
+    template<typename T>
+    void write(const Optional<T>& val)
+    {
+        write((bool)val);
+        if (val)
+            write(*val);
+    }
+
     void write(Color color)
     {
         write(color.color);
@@ -146,7 +155,7 @@ public:
             if (m_write_pos == header_size)
             {
                 if (size() < header_size)
-                    throw remote_error{"invalid message received"};
+                    throw disconnected{"invalid message received"};
                 m_stream.resize(size());
             }
         }
@@ -174,7 +183,7 @@ public:
     void read(char* buffer, size_t size)
     {
         if (m_read_pos + size > m_stream.size())
-            throw remote_error{"tried to read after message end"};
+            throw disconnected{"tried to read after message end"};
         memcpy(buffer, m_stream.data() + m_read_pos, size);
         m_read_pos += size;
     }
@@ -186,7 +195,7 @@ public:
         {
             T object;
             alignas(T) char data[sizeof(T)];
-            U() {}
+            U() {};
             ~U() { object.~T(); }
         } u;
         read(u.data, sizeof(T));
@@ -219,6 +228,14 @@ public:
         return res;
     }
 
+    template<typename T>
+    Optional<T> read_optional()
+    {
+        if (not read<bool>())
+            return {};
+        return read<T>();
+    }
+
     void reset()
     {
         m_stream.resize(0);
@@ -232,8 +249,8 @@ private:
         kak_assert(m_write_pos + size <= m_stream.size());
         int res = ::read(sock, m_stream.data() + m_write_pos, size);
         if (res <= 0)
-            throw remote_error{res ? "peer disconnected"
-                                   : format("socket read failed: {}", strerror(errno))};
+            throw disconnected{res ? format("socket read failed: {}", strerror(errno))
+                                   : "peer disconnected", res == 0};
         m_write_pos += res;
     }
 
@@ -297,7 +314,7 @@ class RemoteUI : public UserInterface
 {
 public:
     RemoteUI(int socket, DisplayCoord dimensions);
-    ~RemoteUI();
+    ~RemoteUI() override;
 
     void menu_show(ConstArrayView<DisplayLine> choices,
                    DisplayCoord anchor, Face fg, Face bg,
@@ -346,8 +363,8 @@ static bool send_data(int fd, RemoteBuffer& buffer)
     {
       int res = ::write(fd, buffer.data(), buffer.size());
       if (res <= 0)
-          throw remote_error{res ? "peer disconnected"
-                                 : format("socket write failed: {}", strerror(errno))};
+          throw disconnected{res ? format("socket write failed: {}", strerror(errno))
+                                 : "peer disconnected", res == 0};
       buffer.erase(buffer.begin(), buffer.begin() + res);
     }
     return buffer.empty();
@@ -382,7 +399,7 @@ RemoteUI::RemoteUI(int socket, DisplayCoord dimensions)
                    m_on_key(key);
               }
           }
-          catch (const remote_error& err)
+          catch (const disconnected& err)
           {
               write_to_debug_buffer(format("Error while transfering remote messages: {}", err.what()));
               ClientManager::instance().remove_client(*m_client, false);
@@ -485,9 +502,10 @@ static sockaddr_un session_addr(StringView session)
     sockaddr_un addr;
     addr.sun_family = AF_UNIX;
     if (find(session, '/')!= session.end())
-        format_to(addr.sun_path, "/tmp/kakoune/{}", session);
+        format_to(addr.sun_path, "{}/kakoune/{}", tmpdir(), session);
     else
-        format_to(addr.sun_path, "/tmp/kakoune/{}/{}", getpwuid(geteuid())->pw_name, session);
+        format_to(addr.sun_path, "{}/kakoune/{}/{}", tmpdir(),
+                  getpwuid(geteuid())->pw_name, session);
     return addr;
 }
 
@@ -497,7 +515,7 @@ static int connect_to(StringView session)
     fcntl(sock, F_SETFD, FD_CLOEXEC);
     sockaddr_un addr = session_addr(session);
     if (connect(sock, (sockaddr*)&addr, sizeof(addr.sun_path)) == -1)
-        throw remote_error(format("connect to {} failed", addr.sun_path));
+        throw disconnected(format("connect to {} failed", addr.sun_path));
     return sock;
 }
 
@@ -510,7 +528,8 @@ bool check_session(StringView session)
 }
 
 RemoteClient::RemoteClient(StringView session, std::unique_ptr<UserInterface>&& ui,
-                           const EnvVarMap& env_vars, StringView init_command)
+                           const EnvVarMap& env_vars, StringView init_command,
+                           Optional<BufferCoord> init_coord)
     : m_ui(std::move(ui))
 {
     int sock = connect_to(session);
@@ -518,6 +537,7 @@ RemoteClient::RemoteClient(StringView session, std::unique_ptr<UserInterface>&& 
     {
         MsgWriter msg{m_send_buffer, MessageType::Connect};
         msg.write(init_command);
+        msg.write(init_coord);
         msg.write(m_ui->dimensions());
         msg.write(env_vars);
     }
@@ -651,12 +671,13 @@ private:
             case MessageType::Connect:
             {
                 auto init_cmds = m_reader.read<String>();
+                auto init_coord = m_reader.read_optional<BufferCoord>();
                 auto dimensions = m_reader.read<DisplayCoord>();
                 auto env_vars = m_reader.read_idmap<String, MemoryDomain::EnvVars>();
-                RemoteUI* ui = new RemoteUI{sock, dimensions};
+                auto* ui = new RemoteUI{sock, dimensions};
                 if (auto* client = ClientManager::instance().create_client(
                                        std::unique_ptr<UserInterface>(ui),
-                                       std::move(env_vars), init_cmds, {}))
+                                       std::move(env_vars), init_cmds, init_coord))
                     ui->set_client(client);
 
                 Server::instance().remove_accepter(this);
@@ -685,7 +706,7 @@ private:
                 Server::instance().remove_accepter(this);
             }
         }
-        catch (const remote_error& err)
+        catch (const disconnected& err)
         {
             write_to_debug_buffer(format("accepting connection failed: {}", err.what()));
             close(sock);
@@ -704,13 +725,21 @@ Server::Server(String session_name)
     fcntl(listen_sock, F_SETFD, FD_CLOEXEC);
     sockaddr_un addr = session_addr(m_session);
 
-    make_directory(split_path(addr.sun_path).first);
+    // set sticky bit on the shared kakoune directory
+    make_directory(format("{}/kakoune", tmpdir()), 01777);
+    make_directory(split_path(addr.sun_path).first, 0711);
+
+    // Do not give any access to the socket to other users by default
+    auto old_mask = umask(0077);
+    auto restore_mask = on_scope_end([old_mask]() { umask(old_mask); });
 
     if (bind(listen_sock, (sockaddr*) &addr, sizeof(sockaddr_un)) == -1)
-       throw runtime_error(format("unable to bind listen socket '{}'", addr.sun_path));
+       throw runtime_error(format("unable to bind listen socket '{}': {}",
+                                  addr.sun_path, strerror(errno)));
 
     if (listen(listen_sock, 4) == -1)
-       throw runtime_error(format("unable to listen on socket '{}'", addr.sun_path));
+       throw runtime_error(format("unable to listen on socket '{}': {}",
+                                  addr.sun_path, strerror(errno)));
 
     auto accepter = [this](FDWatcher& watcher, FdEvents, EventMode mode) {
         sockaddr_un client_addr;
@@ -728,8 +757,10 @@ Server::Server(String session_name)
 
 bool Server::rename_session(StringView name)
 {
-    String old_socket_file = format("/tmp/kakoune/{}/{}", getpwuid(geteuid())->pw_name, m_session);
-    String new_socket_file = format("/tmp/kakoune/{}/{}", getpwuid(geteuid())->pw_name, name);
+    String old_socket_file = format("{}/kakoune/{}/{}", tmpdir(),
+                                    getpwuid(geteuid())->pw_name, m_session);
+    String new_socket_file = format("{}/kakoune/{}/{}", tmpdir(),
+                                    getpwuid(geteuid())->pw_name, name);
 
     if (rename(old_socket_file.c_str(), new_socket_file.c_str()) != 0)
         return false;
@@ -742,7 +773,8 @@ void Server::close_session(bool do_unlink)
 {
     if (do_unlink)
     {
-        String socket_file = format("/tmp/kakoune/{}/{}", getpwuid(geteuid())->pw_name, m_session);
+        String socket_file = format("{}/kakoune/{}/{}", tmpdir(),
+                                    getpwuid(geteuid())->pw_name, m_session);
         unlink(socket_file.c_str());
     }
     m_listener->close_fd();

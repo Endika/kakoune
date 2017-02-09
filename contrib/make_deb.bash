@@ -3,7 +3,7 @@
 ## make_deb.bash for kakoune
 ## by lenormf
 ##
-## Dependencies: build-essential, devscripts, debmake
+## Dependencies: build-essential, devscripts, debmake, asciidoc
 ## Guidelines for making binary packages: https://www.debian.org/doc/debian-policy/ch-binary.html
 
 set -e
@@ -73,6 +73,10 @@ function main {
         exit
     fi
 
+## os.getlogin() does not always work, e.g. in docker
+    export DEBEMAIL="${maintainer_email}"
+    export DEBFULLNAME="${maintainer_fullname}"
+
     readonly PATH_KAKOUNE=$(readlink -e $(dirname $(readlink -f "$0"))/..)
     readonly PATH_DIR_TMP=$(mktemp -d)
 ## TODO: assign the proper kakoune version whenever possible
@@ -109,7 +113,7 @@ function main {
 
 ## FIXME: make a patch
     echo "Disabling copying the README file to the doc directory"
-    sed -r -i 's,(install -m [0-9]+ \.\./README\.asciidoc .+),#\1,' "${DIR_KAKOUNE}/Makefile"
+    sed -r -i 's,(install.*\.\./README\.asciidoc.+),#\1,' "${DIR_KAKOUNE}/Makefile"
 
 ## FIXME: make a patch
     echo "Setting the prefix of the installation procedure"

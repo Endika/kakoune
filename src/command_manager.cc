@@ -47,6 +47,8 @@ namespace
 struct Reader
 {
 public:
+    Reader(StringView s) : str{s}, pos{}, coord{} {}
+
     [[gnu::always_inline]]
     char operator*() const { return str[pos]; }
 
@@ -386,8 +388,7 @@ String expand_impl(StringView str, const Context& context,
 String expand(StringView str, const Context& context,
               const ShellContext& shell_context)
 {
-    return expand_impl(str, context, shell_context,
-                       [](String s) { return std::move(s); });
+    return expand_impl(str, context, shell_context, [](String s){ return s; });
 }
 
 String expand(StringView str, const Context& context,
@@ -416,12 +417,19 @@ CommandManager::find_command(const Context& context, const String& name) const
 void CommandManager::execute_single_command(CommandParameters params,
                                             Context& context,
                                             const ShellContext& shell_context,
-                                            DisplayCoord pos) const
+                                            DisplayCoord pos)
 {
     if (params.empty())
         return;
 
-    ConstArrayView<String> param_view(params.begin()+1, params.end());
+    constexpr int max_command_depth = 100;
+    if (m_command_depth > max_command_depth)
+        throw runtime_error("maximum nested command depth hit");
+
+    ++m_command_depth;
+    auto pop_cmd = on_scope_end([this] { --m_command_depth; });
+
+    ParameterList param_view(params.begin()+1, params.end());
     auto command_it = find_command(context, params[0]);
     if (command_it == m_commands.end())
         throw command_not_found(params[0]);
@@ -479,7 +487,7 @@ void CommandManager::execute(StringView command_line,
     execute_single_command(params, context, shell_context, command_coord);
 }
 
-CommandInfo CommandManager::command_info(const Context& context, StringView command_line) const
+Optional<CommandInfo> CommandManager::command_info(const Context& context, StringView command_line) const
 {
     TokenList tokens = parse<false>(command_line);
     size_t cmd_idx = 0;
@@ -489,19 +497,19 @@ CommandInfo CommandManager::command_info(const Context& context, StringView comm
             cmd_idx = i+1;
     }
 
-    CommandInfo res;
     if (cmd_idx == tokens.size() or
         (tokens[cmd_idx].type() != Token::Type::Raw and
          tokens[cmd_idx].type() != Token::Type::RawQuoted))
-        return res;
+        return {};
 
     auto cmd = find_command(context, tokens[cmd_idx].content());
     if (cmd == m_commands.end())
-        return res;
+        return {};
 
-    res.first = cmd->first;
+    CommandInfo res;
+    res.name = cmd->first;
     if (not cmd->second.docstring.empty())
-        res.second += cmd->second.docstring + "\n";
+        res.info += cmd->second.docstring + "\n";
 
     if (cmd->second.helper)
     {
@@ -520,7 +528,7 @@ CommandInfo CommandManager::command_info(const Context& context, StringView comm
         {
             if (helpstr.back() != '\n')
                 helpstr += '\n';
-            res.second += helpstr;
+            res.info += helpstr;
         }
     }
 
@@ -528,14 +536,14 @@ CommandInfo CommandManager::command_info(const Context& context, StringView comm
     for (auto& alias : context.aliases().aliases_for(cmd->first))
         aliases += " " + alias;
     if (not aliases.empty())
-        res.second += "Aliases:" + aliases + "\n";
+        res.info += "Aliases:" + aliases + "\n";
 
 
     auto& switches = cmd->second.param_desc.switches;
     if (not switches.empty())
     {
-        res.second += "Switches:\n";
-        res.second += generate_switches_doc(switches);
+        res.info += "Switches:\n";
+        res.info += generate_switches_doc(switches);
     }
 
     return res;
@@ -635,7 +643,7 @@ Completions CommandManager::complete(const Context& context,
         for (auto it = tokens.begin() + cmd_idx + 1; it != tokens.end(); ++it)
             params.push_back(it->content());
         if (tok_idx == tokens.size())
-            params.push_back("");
+            params.emplace_back("");
         Completions completions = offset_pos(command_it->second.completer(
             context, flags, params, tok_idx - cmd_idx - 1,
             cursor_pos_in_token), start);

@@ -12,8 +12,10 @@
 #include "user_interface.hh"
 #include "window.hh"
 
-#include <signal.h>
+#include <csignal>
 #include <unistd.h>
+
+#include <utility>
 
 namespace Kakoune
 {
@@ -26,7 +28,7 @@ Client::Client(std::unique_ptr<UserInterface>&& ui,
     : m_ui{std::move(ui)}, m_window{std::move(window)},
       m_input_handler{std::move(selections), Context::Flags::None,
                       std::move(name)},
-      m_env_vars(env_vars)
+      m_env_vars(std::move(env_vars))
 {
     m_window->set_client(this);
 
@@ -53,6 +55,10 @@ Client::~Client()
 {
     m_window->options().unregister_watcher(*this);
     m_window->set_client(nullptr);
+    // Do not move the selections here, as we need them to be valid
+    // in order to correctly destroy the input handler
+    ClientManager::instance().add_free_window(std::move(m_window),
+                                              context().selections());
 }
 
 bool Client::process_pending_inputs()
@@ -79,6 +85,8 @@ bool Client::process_pending_inputs()
             }
             else
                 m_input_handler.handle_key(key);
+
+            context().hooks().run_hook("RawKey", key_to_str(key), context());
         }
         catch (Kakoune::runtime_error& error)
         {
@@ -287,7 +295,7 @@ void Client::close_buffer_reload_dialog()
 {
     kak_assert(m_buffer_reload_dialog_opened);
     m_buffer_reload_dialog_opened = false;
-    info_hide();
+    info_hide(true);
     m_input_handler.reset_normal_mode();
 }
 
@@ -311,7 +319,7 @@ void Client::check_if_buffer_needs_reloading()
         info_show(format("reload '{}' ?", bufname),
                   format("'{}' was modified externally\n"
                          "press <ret> or y to reload, <esc> or n to keep",
-                         bufname), {}, InfoStyle::Prompt);
+                         bufname), {}, InfoStyle::Modal);
 
         m_buffer_reload_dialog_opened = true;
         m_input_handler.on_next_key(KeymapMode::None, [this](Key key, Context&){ on_buffer_reload_key(key); });
@@ -360,13 +368,19 @@ void Client::menu_hide()
 
 void Client::info_show(String title, String content, BufferCoord anchor, InfoStyle style)
 {
+    if (m_info.style == InfoStyle::Modal) // We already have a modal info opened, do not touch it.
+        return;
+
     m_info = Info{ std::move(title), std::move(content), anchor, {}, style };
     m_ui_pending |= InfoShow;
     m_ui_pending &= ~InfoHide;
 }
 
-void Client::info_hide()
+void Client::info_hide(bool even_modal)
 {
+    if (not even_modal and m_info.style == InfoStyle::Modal)
+        return;
+
     m_info = Info{};
     m_ui_pending |= InfoHide;
     m_ui_pending &= ~InfoShow;

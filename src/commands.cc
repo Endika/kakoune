@@ -28,6 +28,7 @@
 #include "window.hh"
 
 #include <functional>
+#include <utility>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -121,8 +122,8 @@ static Completions complete_buffer_name(const Context& context, CompletionFlags 
 {
     struct RankedMatchAndBuffer : RankedMatch
     {
-        RankedMatchAndBuffer(const RankedMatch& m, const Buffer* b)
-            : RankedMatch{m}, buffer{b} {}
+        RankedMatchAndBuffer(RankedMatch  m, const Buffer* b)
+            : RankedMatch{std::move(m)}, buffer{b} {}
 
         using RankedMatch::operator==;
         using RankedMatch::operator<;
@@ -523,22 +524,26 @@ void cycle_buffer(const ParametersParser& parser, Context& context, const ShellC
     auto it = find_if(BufferManager::instance(),
                       [oldbuf](const std::unique_ptr<Buffer>& lhs)
                       { return lhs.get() == oldbuf; });
-
     kak_assert(it != BufferManager::instance().end());
 
-    if (not next)
-    {
-        if (it == BufferManager::instance().begin())
-            it = BufferManager::instance().end();
-        --it;
-    }
-    else
-    {
-        if (++it == BufferManager::instance().end())
-            it = BufferManager::instance().begin();
-    }
-
-    Buffer* newbuf = it->get();
+    Buffer* newbuf = nullptr;
+    auto cycle = [&] {
+        if (not next)
+        {
+            if (it == BufferManager::instance().begin())
+                it = BufferManager::instance().end();
+            --it;
+        }
+        else
+        {
+            if (++it == BufferManager::instance().end())
+                it = BufferManager::instance().begin();
+        }
+        newbuf = it->get();
+    };
+    cycle();
+    if (newbuf->flags() & Buffer::Flags::Debug)
+        cycle();
 
     if (newbuf != oldbuf)
     {
@@ -779,7 +784,7 @@ const CommandDesc add_hook_cmd = {
     "            (and any window for that buffer)\n"
     "  * window: hook is executed only for the current window\n",
     ParameterDesc{
-        { { "group", { true, "set hook group, see rmhooks" } } },
+        { { "group", { true, "set hook group, see remove-hooks" } } },
         ParameterDesc::Flags::None, 4, 4
     },
     CommandFlags::None,
@@ -877,15 +882,16 @@ void define_command(const ParametersParser& parser, Context& context, const Shel
             min = max = (size_t)str_to_int(counts);
 
         desc = ParameterDesc{ {}, ParameterDesc::Flags::SwitchesAsPositional, min, max };
-        cmd = [=](const ParametersParser& parser, Context& context, const ShellContext&) {
-            CommandManager::instance().execute(commands, context, { params_to_shell(parser) });
+        cmd = [=](const ParametersParser& parser, Context& context, const ShellContext& sc) {
+            CommandManager::instance().execute(commands, context,
+                                               { params_to_shell(parser), sc.env_vars });
         };
     }
     else
     {
         desc = ParameterDesc{ {}, ParameterDesc::Flags::SwitchesAsPositional, 0, 0 };
-        cmd = [=](const ParametersParser& parser, Context& context, const ShellContext&) {
-            CommandManager::instance().execute(commands, context);
+        cmd = [=](const ParametersParser& parser, Context& context, const ShellContext& sc) {
+            CommandManager::instance().execute(commands, context, { {}, sc.env_vars });
         };
     }
 
@@ -952,7 +958,7 @@ void define_command(const ParametersParser& parser, Context& context, const Shel
     else if (auto shell_cmd_opt = parser.get_switch("shell-candidates"))
     {
         String shell_cmd = shell_cmd_opt->str();
-        Vector<std::pair<String, UsedLetters>> candidates;
+        Vector<std::pair<String, UsedLetters>, MemoryDomain::Completion> candidates;
         int token = -1;
         completer = [shell_cmd, candidates, token](
             const Context& context, CompletionFlags flags, CommandParameters params,
@@ -972,7 +978,7 @@ void define_command(const ParametersParser& parser, Context& context, const Shel
                                                               shell_context).first;
                 candidates.clear();
                 for (auto c : output | split<StringView>('\n'))
-                    candidates.push_back({c.str(), used_letters(c)});
+                    candidates.emplace_back(c.str(), used_letters(c));
                 token = token_to_complete;
             }
 
@@ -1176,10 +1182,12 @@ const CommandDesc source_cmd = {
     filename_completer,
     [](const ParametersParser& parser, Context& context, const ShellContext&)
     {
-        String file_content = read_file(parse_filename(parser[0]), true);
+        String path = real_path(parse_filename(parser[0]));
+        String file_content = read_file(path, true);
         try
         {
-            CommandManager::instance().execute(file_content, context);
+            CommandManager::instance().execute(file_content, context,
+                                               {{}, {{"source", path}}});
         }
         catch (Kakoune::runtime_error& err)
         {
@@ -1324,7 +1332,7 @@ const CommandDesc declare_option_cmd = {
         if (parser[0] == "int")
             opt = &reg.declare_option<int>(parser[1], docstring, 0, flags);
         else if (parser[0] == "bool")
-            opt = &reg.declare_option<bool>(parser[1], docstring, 0, flags);
+            opt = &reg.declare_option<bool>(parser[1], docstring, false, flags);
         else if (parser[0] == "str")
             opt = &reg.declare_option<String>(parser[1], docstring, "", flags);
         else if (parser[0] == "regex")
@@ -1423,7 +1431,7 @@ const CommandDesc unmap_key_cmd = {
     "    view\n"
     "    user\n"
     "    object\n",
-    ParameterDesc{{}, ParameterDesc::Flags::None, 4, 4},
+    ParameterDesc{{}, ParameterDesc::Flags::None, 3, 4},
     CommandFlags::None,
     CommandHelper{},
     map_key_completer,
@@ -1678,10 +1686,21 @@ const CommandDesc eval_string_cmd = {
     }
 };
 
+struct CapturedShellContext
+{
+    explicit CapturedShellContext(const ShellContext& sc)
+      : params{sc.params.begin(), sc.params.end()}, env_vars{sc.env_vars} {}
+
+    Vector<String> params;
+    EnvVarMap env_vars;
+
+    operator ShellContext() const { return { params, env_vars }; }
+};
+
 const CommandDesc prompt_cmd = {
     "prompt",
     nullptr,
-    "prompt <prompt> <command>: prompt the use to enter a text string"
+    "prompt <prompt> <command>: prompt the user to enter a text string "
     "and then executes <command>, entered text is available in the 'text' value",
     ParameterDesc{
         { { "init", { true, "set initial prompt content" } },
@@ -1727,8 +1746,7 @@ const CommandDesc prompt_cmd = {
         const auto flags = parser.get_switch("password") ?
             PromptFlags::Password : PromptFlags::None;
 
-        // const cast so that lambda capute is mutable
-        ShellContext& sc = const_cast<ShellContext&>(shell_context);
+        CapturedShellContext sc{shell_context};
         context.input_handler().prompt(
             parser[0], initstr.str(), get_face("Prompt"),
             flags, std::move(completer),
@@ -1795,14 +1813,15 @@ const CommandDesc menu_cmd = {
                 select_cmds.push_back(parser[i+2]);
         }
 
+        CapturedShellContext sc{shell_context};
         context.input_handler().menu(std::move(choices),
             [=](int choice, MenuEvent event, Context& context) {
                 ScopedSetBool disable_history{context.history_disabled()};
 
                 if (event == MenuEvent::Validate and choice >= 0 and choice < commands.size())
-                  CommandManager::instance().execute(commands[choice], context, shell_context);
+                  CommandManager::instance().execute(commands[choice], context, sc);
                 if (event == MenuEvent::Select and choice >= 0 and choice < select_cmds.size())
-                  CommandManager::instance().execute(select_cmds[choice], context, shell_context);
+                  CommandManager::instance().execute(select_cmds[choice], context, sc);
             });
     }
 };
@@ -1820,8 +1839,7 @@ const CommandDesc on_key_cmd = {
     {
         String command = parser[0];
 
-        // const cast so that the lambda capute is mutable
-        ShellContext& sc = const_cast<ShellContext&>(shell_context);
+        CapturedShellContext sc{shell_context};
         context.input_handler().on_next_key(
             KeymapMode::None, [=](Key key, Context& context) mutable {
             sc.env_vars["key"] = key_to_str(key);

@@ -25,14 +25,14 @@ For example to automatically use line numbering with .cc files, use the
 following command:
 
 ----------------------------------------------------
-hook global WinCreate .*\.cc %{ addhl number_lines }
+hook global WinCreate .*\.cc %{ add-highlighter number_lines }
 ----------------------------------------------------
 
 if *group* is given, make this hook part of the named group. Groups are used
 for removing hooks with the following command:
 
 -----------------------
-rmhooks <scope> <group>
+remove-hooks <scope> <group>
 -----------------------
 
 A call to the command above will remove every hooks in *scope* that are part
@@ -117,7 +117,7 @@ Default hooks
 	executed when a buffer opens a fifo
 
 *BufReadFifo*::
-	executed after some data has been red from a fifo and inserted in
+	executed after some data has been read from a fifo and inserted in
 	the buffer
 
 *BufCloseFifo*::
@@ -149,6 +149,10 @@ Default hooks
 
 *InsertCompletionHide*::
 	Triggered when the insert completion menu gets hidden
+
+*RawKey*::
+	Triggered whenever an key is pressed by the user, the key is
+	used for filtering.
 
 When not specified, the filtering text is an empty string. Note that
 some hooks will not consider underlying scopes depending on what context

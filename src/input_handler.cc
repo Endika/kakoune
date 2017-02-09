@@ -1,3 +1,5 @@
+#include <utility>
+
 #include "input_handler.hh"
 
 #include "buffer_manager.hh"
@@ -21,7 +23,7 @@ class InputMode : public RefCountable
 {
 public:
     InputMode(InputHandler& input_handler) : m_input_handler(input_handler) {}
-    virtual ~InputMode() {}
+    ~InputMode() override = default;
     InputMode(const InputMode&) = delete;
     InputMode& operator=(const InputMode&) = delete;
 
@@ -140,7 +142,8 @@ constexpr StringView register_doc =
     "    * \": default yank/paste register\n"
     "    * @: default macro register\n"
     "    * /: default search register\n"
-    "    * ^: default mark register\n";
+    "    * ^: default mark register\n"
+    "    * |: default shell command register\n";
 
 class Normal : public InputMode
 {
@@ -196,8 +199,8 @@ public:
 
     void on_key(Key key) override
     {
-        m_in_on_key = true;
-        auto unset_in_on_key = on_scope_end([this]{ m_in_on_key = false; });
+        m_in_on_key.set();
+        auto unset_in_on_key = on_scope_end([this]{ m_in_on_key.unset(); });
 
         bool do_restore_hooks = false;
         auto restore_hooks = on_scope_end([&, this]{
@@ -282,13 +285,13 @@ public:
         AtomList atoms = { { to_string(context().selections().size()) + " sel", get_face("StatusLineInfo") } };
         if (m_params.count != 0)
         {
-            atoms.push_back({ " param=", get_face("StatusLineInfo") });
-            atoms.push_back({ to_string(m_params.count), get_face("StatusLineValue") });
+            atoms.emplace_back(" param=", get_face("StatusLineInfo"));
+            atoms.emplace_back(to_string(m_params.count), get_face("StatusLineValue"));
         }
         if (m_params.reg)
         {
-            atoms.push_back({ " reg=", get_face("StatusLineInfo") });
-            atoms.push_back({ StringView(m_params.reg).str(), get_face("StatusLineValue") });
+            atoms.emplace_back(" reg=", get_face("StatusLineInfo"));
+            atoms.emplace_back(StringView(m_params.reg).str(), get_face("StatusLineValue"));
         }
         return atoms;
     }
@@ -301,7 +304,7 @@ private:
     NormalParams m_params = { 0, 0 };
     bool m_hooks_disabled = false;
     bool m_enabled = false;
-    bool m_in_on_key = false;
+    NestedBool m_in_on_key;
     Timer m_idle_timer;
     Timer m_fs_check_timer;
     MouseHandler m_mouse_handler;
@@ -425,6 +428,13 @@ public:
             to_next_word_end<Word>(m_cursor_pos, m_line);
         else if (key == ctrlalt('e'))
             to_next_word_end<WORD>(m_cursor_pos, m_line);
+        else if (key == ctrl('k'))
+            m_line = m_line.substr(0_char, m_cursor_pos).str();
+        else if (key == ctrl('u'))
+        {
+            m_line = m_line.substr(m_cursor_pos).str();
+            m_cursor_pos = 0;
+        }
         else if (auto cp = key.codepoint())
             insert(*cp);
     }
@@ -506,7 +516,7 @@ public:
     Menu(InputHandler& input_handler, Vector<DisplayLine> choices,
          MenuCallback callback)
         : InputMode(input_handler),
-          m_callback(callback), m_choices(choices.begin(), choices.end()),
+          m_callback(std::move(callback)), m_choices(choices.begin(), choices.end()),
           m_selected(m_choices.begin())
     {
         if (not context().has_client())
@@ -670,7 +680,7 @@ public:
            String initstr, Face face, PromptFlags flags,
            Completer completer, PromptCallback callback)
         : InputMode(input_handler), m_prompt(prompt.str()), m_prompt_face(face),
-          m_flags(flags), m_completer(completer), m_callback(callback),
+          m_flags(flags), m_completer(std::move(completer)), m_callback(std::move(callback)),
           m_autoshowcompl{context().options()["autoshowcompl"].get<bool>()}
     {
         m_history_it = ms_history[m_prompt].end();
@@ -913,7 +923,12 @@ private:
         context().print_status(display_line);
     }
 
-    void on_enabled() override { display(); }
+    void on_enabled() override
+    {
+        display();
+        m_callback(m_line_editor.line(), PromptEvent::Change, context());
+    }
+
     void on_disabled() override { context().print_status({}); }
 
     PromptCallback m_callback;
@@ -927,7 +942,6 @@ private:
     LineEditor     m_line_editor;
     bool           m_autoshowcompl;
     PromptFlags    m_flags;
-    bool           m_history_drop_blank_prefix;
 
     using History = Vector<String, MemoryDomain::History>;
     static UnorderedMap<String, History, MemoryDomain::History> ms_history;
@@ -979,7 +993,7 @@ class Insert : public InputMode
 public:
     Insert(InputHandler& input_handler, InsertMode mode, int count)
         : InputMode(input_handler),
-          m_insert_mode(mode),
+          m_restore_cursor(mode == InsertMode::Append),
           m_edition(context()),
           m_completer(context()),
           m_autoshowcompl(true),
@@ -994,16 +1008,24 @@ public:
         last_insert().keys.clear();
         last_insert().disable_hooks = context().hooks_disabled();
         context().hooks().run_hook("InsertBegin", "", context());
-        prepare(m_insert_mode, count);
+        prepare(mode, count);
+
+        if (context().has_client() and
+            context().options()["readonly"].get<bool>())
+            context().print_status({ "Warning: This buffer is readonly",
+                                     get_face("Error") });
     }
 
-    ~Insert()
+    ~Insert() override
     {
         auto& selections = context().selections();
-        for (auto& sel : selections)
+        if (m_restore_cursor)
         {
-            if (m_insert_mode == InsertMode::Append and sel.cursor().column > 0)
-                sel.cursor() = context().buffer().char_prev(sel.cursor());
+            for (auto& sel : selections)
+            {
+                if (sel.cursor() > sel.anchor() and sel.cursor().column > 0)
+                    sel.cursor() = context().buffer().char_prev(sel.cursor());
+            }
         }
         selections.avoid_eol();
     }
@@ -1045,7 +1067,7 @@ public:
                 if (sel.cursor() == BufferCoord{0,0})
                     continue;
                 auto pos = sel.cursor();
-                sels.push_back({ buffer.char_prev(pos) });
+                sels.emplace_back(buffer.char_prev(pos));
             }
             if (not sels.empty())
                 SelectionList{buffer, std::move(sels)}.erase();
@@ -1054,7 +1076,7 @@ public:
         {
             Vector<Selection> sels;
             for (auto& sel : context().selections())
-                sels.push_back({ sel.cursor() });
+                sels.emplace_back(sel.cursor());
             SelectionList{buffer, std::move(sels)}.erase();
         }
         else if (key == Key::Left)
@@ -1226,7 +1248,7 @@ private:
         {
         case InsertMode::Insert:
             for (auto& sel : selections)
-                sel = Selection{sel.max(), sel.min()};
+                sel.set(sel.max(), sel.min());
             break;
         case InsertMode::Replace:
             selections.erase();
@@ -1234,7 +1256,7 @@ private:
         case InsertMode::Append:
             for (auto& sel : selections)
             {
-                sel = Selection{sel.min(), sel.max()};
+                sel.set(sel.min(), sel.max());
                 auto& cursor = sel.cursor();
                 // special case for end of lines, append to current line instead
                 if (cursor.column != buffer[cursor.line].length() - 1)
@@ -1243,23 +1265,23 @@ private:
             break;
         case InsertMode::AppendAtLineEnd:
             for (auto& sel : selections)
-                sel = BufferCoord{sel.max().line, buffer[sel.max().line].length() - 1};
+                sel.set({sel.max().line, buffer[sel.max().line].length() - 1});
             break;
         case InsertMode::OpenLineBelow:
             for (auto& sel : selections)
-                sel = BufferCoord{sel.max().line, buffer[sel.max().line].length() - 1};
+                sel.set({sel.max().line, buffer[sel.max().line].length() - 1});
             duplicate_selections(selections, count);
             insert('\n');
             break;
         case InsertMode::OpenLineAbove:
             for (auto& sel : selections)
-                sel = BufferCoord{sel.min().line};
+                sel.set({sel.min().line});
             duplicate_selections(selections, count);
             // Do not use insert method here as we need to fixup selection
             // before running the InsertChar hook.
             selections.insert("\n"_str, InsertMode::InsertCursor);
             for (auto& sel : selections) // fixup selection positions
-                sel = BufferCoord{sel.cursor().line - 1};
+                sel.set({sel.cursor().line - 1});
             context().hooks().run_hook("InsertChar", "\n", context());
             break;
         case InsertMode::InsertAtLineBegin:
@@ -1271,7 +1293,7 @@ private:
                     ++pos_non_blank;
                 if (*pos_non_blank != '\n')
                     pos = pos_non_blank.coord();
-                sel = pos;
+                sel.set(pos);
             }
             break;
         case InsertMode::InsertAtNextLineBegin:
@@ -1285,13 +1307,13 @@ private:
         buffer.check_invariant();
     }
 
-    InsertMode       m_insert_mode;
-    ScopedEdition    m_edition;
-    InsertCompleter  m_completer;
-    bool             m_autoshowcompl;
-    Timer            m_idle_timer;
-    bool             m_in_end = false;
-    MouseHandler     m_mouse_handler;
+    ScopedEdition   m_edition;
+    InsertCompleter m_completer;
+    bool            m_restore_cursor;
+    bool            m_autoshowcompl;
+    Timer           m_idle_timer;
+    bool            m_in_end = false;
+    MouseHandler    m_mouse_handler;
 };
 
 }
@@ -1303,8 +1325,7 @@ InputHandler::InputHandler(SelectionList selections, Context::Flags flags, Strin
     current_mode().on_enabled();
 }
 
-InputHandler::~InputHandler()
-{}
+InputHandler::~InputHandler() = default;
 
 void InputHandler::push_mode(InputMode* new_mode)
 {

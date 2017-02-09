@@ -1,16 +1,14 @@
 decl str docsclient
 
-def -hidden -params 1..2 _doc-open %{
+def -hidden -params 1..2 doc-open %{
     %sh{
         manout=$(mktemp /tmp/kak-man-XXXXXX)
 
         # Those options are handled by the `man-db` implementation
-        export MAN_KEEP_FORMATTING=y
         export MANWIDTH=${kak_window_width}
 
-        # The BSD implementation requires an `-l` flag to detect a filetype as argument
-        if man -l "$1" > "${manout}"; then
-            sed -i 's/.\x8//g' "${manout}"
+        if man "$1" > "${manout}"; then
+            sed -ie $(printf 's/.\x8//g') "${manout}"
 
             printf %s\\n "
                 edit! -scratch '*doc*'
@@ -32,8 +30,8 @@ def -hidden -params 1..2 _doc-open %{
 
 def -params 1..2 \
     -shell-candidates %{
-        find "${kak_runtime}/../doc/kak/manpages/" -type f -iname "*.gz" -printf '%f\n' | while read l; do
-            printf %s\\n "${l%.*}"
+        find "${kak_runtime}/../doc/kak/manpages/" -type f -iname "*.gz" | while read l; do
+            basename "${l%.*}"
         done
     } \
     doc -docstring %{doc <topic> [<keyword>]: open a buffer containing documentation about a given topic
@@ -47,6 +45,8 @@ An optional keyword argument can be passed to the function, which will be automa
             exit
         fi
 
-        printf %s\\n "eval -try-client %opt{docsclient} _doc-open ${PATH_DOC} $@"
+        printf %s\\n "eval -try-client %opt{docsclient} doc-open ${PATH_DOC} $@"
     }
 }
+
+alias global help doc

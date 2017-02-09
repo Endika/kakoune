@@ -61,7 +61,7 @@ struct FilterView
     using ContainerIt = IteratorOf<Container>;
 
     struct Iterator : std::iterator<std::forward_iterator_tag,
-                                    typename ContainerIt::value_type>
+                                    typename std::iterator_traits<ContainerIt>::value_type>
     {
         Iterator(const FilterView& view, ContainerIt it, ContainerIt end)
             : m_it{std::move(it)}, m_end{std::move(end)}, m_view{view}
@@ -101,7 +101,7 @@ struct FilterView
     Iterator end()   const { return {*this, std::end(m_container), std::end(m_container)}; }
 
     Container m_container;
-    Filter m_filter;
+    mutable Filter m_filter;
 };
 
 template<typename Filter>
@@ -158,7 +158,7 @@ struct TransformView
     Iterator end()   const { return {*this, std::end(m_container)}; }
 
     Container m_container;
-    Transform m_transform;
+    mutable Transform m_transform;
 };
 
 template<typename Transform>
@@ -254,12 +254,13 @@ struct ConcatView
 {
     using ContainerIt1 = decltype(begin(std::declval<Container1>()));
     using ContainerIt2 = decltype(begin(std::declval<Container2>()));
-    using ValueType = typename std::common_type<typename ContainerIt1::value_type, typename ContainerIt2::value_type>::type;
+    using ValueType = typename std::common_type<typename std::iterator_traits<ContainerIt1>::value_type,
+                                                typename std::iterator_traits<ContainerIt2>::value_type>::type;
 
     struct Iterator : std::iterator<std::forward_iterator_tag, ValueType>
     {
-        static_assert(std::is_convertible<typename ContainerIt1::value_type, ValueType>::value, "");
-        static_assert(std::is_convertible<typename ContainerIt2::value_type, ValueType>::value, "");
+        static_assert(std::is_convertible<typename std::iterator_traits<ContainerIt1>::value_type, ValueType>::value, "");
+        static_assert(std::is_convertible<typename std::iterator_traits<ContainerIt2>::value_type, ValueType>::value, "");
 
         Iterator(ContainerIt1 it1, ContainerIt1 end1, ContainerIt2 it2)
             : m_it1(std::move(it1)), m_end1(std::move(end1)),

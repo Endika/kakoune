@@ -12,6 +12,7 @@
 #include "file.hh"
 #include "flags.hh"
 #include "option_manager.hh"
+#include "regex.hh"
 #include "register_manager.hh"
 #include "selectors.hh"
 #include "shell_manager.hh"
@@ -140,6 +141,9 @@ void goto_commands(Context& context, NormalParams params)
             case 'h':
                 select<mode, select_to_line_begin<true>>(context, {});
                 break;
+            case 'i':
+                select<mode, select_to_first_non_blank>(context, {});
+                break;
             case 'j':
                 context.push_jump();
                 select_coord<mode>(buffer, buffer.line_count() - 1, context.selections());
@@ -229,17 +233,18 @@ void goto_commands(Context& context, NormalParams params)
             }
             }
         }, "goto",
-        "g,k:  buffer top        \n"
-        "l:    line end          \n"
-        "h:    line begin        \n"
-        "j:    buffer bottom     \n"
-        "e:    buffer end        \n"
-        "t:    window top        \n"
-        "b:    window bottom     \n"
-        "c:    window center     \n"
-        "a:    last buffer       \n"
-        "f:    file              \n"
-        ".:    last buffer change\n");
+        "g,k:  buffer top          \n"
+        "l:    line end            \n"
+        "h:    line begin          \n"
+        "i:    line non blank start\n"
+        "j:    buffer bottom       \n"
+        "e:    buffer end          \n"
+        "t:    window top          \n"
+        "b:    window bottom       \n"
+        "c:    window center       \n"
+        "a:    last buffer         \n"
+        "f:    file                \n"
+        ".:    last buffer change  \n");
     }
 }
 
@@ -306,7 +311,7 @@ void replace_with_char(Context& context, NormalParams)
     on_next_key_with_autoinfo(context, KeymapMode::None,
                              [](Key key, Context& context) {
         auto cp = key.codepoint();
-        if (not cp)
+        if (not cp or key == Key::Escape)
             return;
         ScopedEdition edition(context);
         Buffer& buffer = context.buffer();
@@ -366,16 +371,21 @@ void command(Context& context, NormalParams params)
             if (context.has_client())
             {
                 context.client().info_hide();
-                auto autoinfo = context.options()["autoinfo"].get<AutoInfo>();
-                if (event == PromptEvent::Change and autoinfo & AutoInfo::Command)
+                if (event == PromptEvent::Change)
                 {
-                    if (cmdline.length() == 1 and is_horizontal_blank(cmdline[0_byte]))
-                        context.client().info_show("prompt", "commands preceded by a blank wont be saved to history",
-                                                   {}, InfoStyle::Prompt);
-
                     auto info = CommandManager::instance().command_info(context, cmdline);
-                    if (not info.first.empty() and not info.second.empty())
-                        context.client().info_show(info.first, info.second, {}, InfoStyle::Prompt);
+                    context.input_handler().set_prompt_face(get_face(info ? "Prompt" : "Error"));
+
+                    auto autoinfo = context.options()["autoinfo"].get<AutoInfo>();
+                    if (autoinfo & AutoInfo::Command)
+                    {
+                        if (cmdline.length() == 1 and is_horizontal_blank(cmdline[0_byte]))
+                            context.client().info_show("prompt",
+                                                       "commands preceded by a blank wont be saved to history",
+                                                       {}, InfoStyle::Prompt);
+                        else if (info and not info->info.empty())
+                            context.client().info_show(info->name, info->info, {}, InfoStyle::Prompt);
+                    }
                 }
             }
             if (event == PromptEvent::Validate)
@@ -483,43 +493,6 @@ void insert_output(Context& context, NormalParams)
         });
 }
 
-template<Direction direction, SelectMode mode>
-void select_next_match(const Buffer& buffer, SelectionList& selections,
-                       const Regex& regex, bool& main_wrapped)
-{
-    const int main_index = selections.main_index();
-    bool wrapped = false;
-    if (mode == SelectMode::Replace)
-    {
-        for (int i = 0; i < selections.size(); ++i)
-        {
-            auto& sel = selections[i];
-            sel = keep_direction(find_next_match<direction>(buffer, sel, regex, wrapped), sel);
-            if (i == main_index)
-                main_wrapped = wrapped;
-        }
-    }
-    if (mode == SelectMode::Extend)
-    {
-        for (int i = 0; i < selections.size(); ++i)
-        {
-            auto& sel = selections[i];
-            sel.merge_with(find_next_match<direction>(buffer, sel, regex, wrapped));
-            if (i == main_index)
-                main_wrapped = wrapped;
-        }
-    }
-    else if (mode == SelectMode::Append)
-    {
-        auto sel = keep_direction(
-            find_next_match<direction>(buffer, selections.main(), regex, main_wrapped),
-            selections.main());
-        selections.push_back(std::move(sel));
-        selections.set_main_index(selections.size() - 1);
-    }
-    selections.sort_and_merge_overlapping();
-}
-
 void yank(Context& context, NormalParams params)
 {
     const char reg = params.reg ? params.reg : '"';
@@ -545,14 +518,15 @@ void change(Context& context, NormalParams params)
     enter_insert_mode<InsertMode::Replace>(context, params);
 }
 
-constexpr InsertMode adapt_for_linewise(InsertMode mode)
+InsertMode adapt_for_linewise(InsertMode mode)
 {
-    return ((mode == InsertMode::Append) ?
-             InsertMode::InsertAtNextLineBegin :
-             ((mode == InsertMode::Insert) ?
-               InsertMode::InsertAtLineBegin :
-               ((mode == InsertMode::Replace) ?
-                 InsertMode::Replace : InsertMode::Insert)));
+    switch (mode)
+    {
+        case InsertMode::Append: return InsertMode::InsertAtNextLineBegin;
+        case InsertMode::Insert: return InsertMode::InsertAtLineBegin;
+        case InsertMode::Replace: return InsertMode::Replace;
+        default: return InsertMode::Insert;
+    }
 }
 
 template<InsertMode mode>
@@ -560,15 +534,11 @@ void paste(Context& context, NormalParams params)
 {
     const char reg = params.reg ? params.reg : '"';
     auto strings = RegisterManager::instance()[reg].values(context);
-    InsertMode effective_mode = mode;
-    for (auto& str : strings)
-    {
-        if (not str.empty() and str.back() == '\n')
-        {
-            effective_mode = adapt_for_linewise(mode);
-            break;
-        }
-    }
+    const bool linewise = contains_that(strings, [](StringView str) {
+        return not str.empty() and str.back() == '\n';
+    });
+    const auto effective_mode = linewise ? adapt_for_linewise(mode) : mode;
+
     ScopedEdition edition(context);
     context.selections().insert(strings, effective_mode);
 }
@@ -592,21 +562,22 @@ void paste_all(Context& context, NormalParams params)
         offsets.push_back(all.length());
     }
 
+    Vector<BufferCoord> insert_pos;
     auto& selections = context.selections();
     {
         ScopedEdition edition(context);
-        selections.insert(all, effective_mode, true);
+        selections.insert(all, effective_mode, &insert_pos);
     }
 
     const Buffer& buffer = context.buffer();
     Vector<Selection> result;
-    for (auto& selection : selections)
+    for (auto& ins_pos : insert_pos)
     {
         ByteCount pos = 0;
         for (auto offset : offsets)
         {
-            result.push_back({ buffer.advance(selection.min(), pos),
-                               buffer.advance(selection.min(), offset-1) });
+            result.emplace_back(buffer.advance(ins_pos, pos),
+                                buffer.advance(ins_pos, offset-1));
             pos = offset;
         }
     }
@@ -638,8 +609,7 @@ void regex_prompt(Context& context, String prompt, T func)
                     context.input_handler().set_prompt_face(get_face("Prompt"));
                 }
 
-                if (event == PromptEvent::Abort or
-                    (event == PromptEvent::Change and (not incsearch or str.empty())))
+                if (not incsearch and event == PromptEvent::Change)
                     return;
 
                 if (event == PromptEvent::Validate)
@@ -673,19 +643,41 @@ void search(Context& context, NormalParams params)
       : (direction == Forward ? "search:"          : "reverse search:");
 
     const char reg = to_lower(params.reg ? params.reg : '/');
-    int count = params.count;
+    const int count = params.count;
+
+    auto reg_content = RegisterManager::instance()[reg].values(context);
+    Vector<String> saved_reg{reg_content.begin(), reg_content.end()};
+    const int main_index = std::min(context.selections().main_index(), saved_reg.size()-1);
+
     regex_prompt(context, prompt.str(),
-                 [reg, count](Regex ex, PromptEvent event, Context& context) {
-                     if (ex.empty())
-                         ex = Regex{context.main_sel_register_value(reg)};
-                     else if (event == PromptEvent::Validate)
-                         RegisterManager::instance()[reg] = ex.str();
-                     if (not ex.empty() and not ex.str().empty())
+                 [reg, count, saved_reg, main_index]
+                 (Regex regex, PromptEvent event, Context& context) {
+                     if (event == PromptEvent::Abort)
                      {
-                         bool main_wrapped = false;
+                         RegisterManager::instance()[reg] = saved_reg;
+                         return;
+                     }
+
+                     if (regex.empty())
+                         regex = Regex{saved_reg[main_index]};
+                     RegisterManager::instance()[reg] = regex.str();
+
+                     if (not regex.empty() and not regex.str().empty())
+                     {
                          int c = count;
+                         auto& selections = context.selections();
+                         auto& buffer = context.buffer();
                          do {
-                             select_next_match<direction, mode>(context.buffer(), context.selections(), ex, main_wrapped);
+                            bool wrapped = false;
+                            for (int i = 0; i < selections.size(); ++i)
+                            {
+                                auto& sel = selections[i];
+                                if (mode == SelectMode::Replace)
+                                    sel = keep_direction(find_next_match<direction>(buffer, sel, regex, wrapped), sel);
+                                if (mode == SelectMode::Extend)
+                                    sel.merge_with(find_next_match<direction>(buffer, sel, regex, wrapped));
+                            }
+                            selections.sort_and_merge_overlapping();
                          } while (--c > 0);
                      }
                  });
@@ -698,11 +690,26 @@ void search_next(Context& context, NormalParams params)
     StringView str = context.main_sel_register_value(reg);
     if (not str.empty())
     {
-        Regex ex{str};
+        Regex regex{str};
+        auto& selections = context.selections();
+        auto& buffer = context.buffer();
         bool main_wrapped = false;
         do {
             bool wrapped = false;
-            select_next_match<direction, mode>(context.buffer(), context.selections(), ex, wrapped);
+            if (mode == SelectMode::Replace)
+            {
+                auto& sel = selections.main();
+                sel = keep_direction(find_next_match<direction>(buffer, sel, regex, wrapped), sel);
+            }
+            else if (mode == SelectMode::Append)
+            {
+                auto sel = keep_direction(
+                    find_next_match<direction>(buffer, selections.main(), regex, wrapped),
+                    selections.main());
+                selections.push_back(std::move(sel));
+                selections.set_main_index(selections.size() - 1);
+            }
+            selections.sort_and_merge_overlapping();
             main_wrapped = main_wrapped or wrapped;
         } while (--params.count > 0);
 
@@ -744,14 +751,25 @@ void use_selection_as_search_pattern(Context& context, NormalParams params)
 void select_regex(Context& context, NormalParams params)
 {
     const char reg = to_lower(params.reg ? params.reg : '/');
-    unsigned capture = (unsigned)params.count;
-    auto prompt = capture ? format("select (capture {}):", (int)capture) :  "select:"_str;
+    const int capture = params.count;
+    auto prompt = capture ? format("select (capture {}):", capture) :  "select:"_str;
+
+    auto reg_content = RegisterManager::instance()[reg].values(context);
+    Vector<String> saved_reg{reg_content.begin(), reg_content.end()};
+    const int main_index = std::min(context.selections().main_index(), saved_reg.size()-1);
+
     regex_prompt(context, std::move(prompt),
-                 [reg, capture](Regex ex, PromptEvent event, Context& context) {
+                 [reg, capture, saved_reg, main_index](Regex ex, PromptEvent event, Context& context) {
+         if (event == PromptEvent::Abort)
+         {
+             RegisterManager::instance()[reg] = saved_reg;
+             return;
+         }
+
         if (ex.empty())
-            ex = Regex{context.main_sel_register_value(reg)};
-        else if (event == PromptEvent::Validate)
-            RegisterManager::instance()[reg] = ex.str();
+            ex = Regex{saved_reg[main_index]};
+        RegisterManager::instance()[reg] = ex.str();
+
         if (not ex.empty() and not ex.str().empty())
             select_all_matches(context.selections(), ex, capture);
     });
@@ -760,14 +778,25 @@ void select_regex(Context& context, NormalParams params)
 void split_regex(Context& context, NormalParams params)
 {
     const char reg = to_lower(params.reg ? params.reg : '/');
-    unsigned capture = (unsigned)params.count;
+    const int capture = params.count;
     auto prompt = capture ? format("split (on capture {}):", (int)capture) :  "split:"_str;
+
+    auto reg_content = RegisterManager::instance()[reg].values(context);
+    Vector<String> saved_reg{reg_content.begin(), reg_content.end()};
+    const int main_index = std::min(context.selections().main_index(), saved_reg.size()-1);
+
     regex_prompt(context, std::move(prompt),
-                 [reg, capture](Regex ex, PromptEvent event, Context& context) {
+                 [reg, capture, saved_reg, main_index](Regex ex, PromptEvent event, Context& context) {
+         if (event == PromptEvent::Abort)
+         {
+             RegisterManager::instance()[reg] = saved_reg;
+             return;
+         }
+
         if (ex.empty())
-            ex = Regex{context.main_sel_register_value(reg)};
-        else if (event == PromptEvent::Validate)
-            RegisterManager::instance()[reg] = ex.str();
+            ex = Regex{saved_reg[main_index]};
+        RegisterManager::instance()[reg] = ex.str();
+
         if (not ex.empty() and not ex.str().empty())
             split_selections(context.selections(), ex, capture);
     });
@@ -809,7 +838,7 @@ void join_lines_select_spaces(Context& context, NormalParams)
         {
             auto begin = buffer.iterator_at({line, buffer[line].length()-1});
             auto end = std::find_if_not(begin+1, buffer.end(), is_horizontal_blank);
-            selections.push_back({begin.coord(), (end-1).coord()});
+            selections.emplace_back(begin.coord(), (end-1).coord());
         }
     }
     if (selections.empty())
@@ -834,8 +863,8 @@ template<bool matching>
 void keep(Context& context, NormalParams)
 {
     constexpr const char* prompt = matching ? "keep matching:" : "keep not matching:";
-    regex_prompt(context, prompt, [](const Regex& ex, PromptEvent, Context& context) {
-        if (ex.empty())
+    regex_prompt(context, prompt, [](const Regex& ex, PromptEvent event, Context& context) {
+        if (ex.empty() or event == PromptEvent::Abort)
             return;
         const Buffer& buffer = context.buffer();
 
@@ -895,7 +924,7 @@ void indent(Context& context, NormalParams)
         for (auto line = std::max(last_line, sel.min().line); line < sel.max().line+1; ++line)
         {
             if (indent_empty or buffer[line].length() > 1)
-                sels.push_back({line, line});
+                sels.emplace_back(line, line);
         }
         // avoid reindenting the same line if multiple selections are on it
         last_line = sel.max().line+1;
@@ -936,12 +965,12 @@ void deindent(Context& context, NormalParams)
                 else
                 {
                     if (deindent_incomplete and width != 0)
-                        sels.push_back({ line, BufferCoord{line, column-1} });
+                        sels.emplace_back(line, BufferCoord{line, column-1});
                     break;
                 }
                 if (width == indent_width)
                 {
-                    sels.push_back({ line, BufferCoord{line, column} });
+                    sels.emplace_back(line, BufferCoord{line, column});
                     break;
                 }
             }
@@ -1011,7 +1040,7 @@ void select_object(Context& context, NormalParams params)
                         return;
 
                     Vector<String> params = split(cmdline, ',', '\\');
-                    if (params.size() != 2)
+                    if (params.size() != 2 or params[0].empty() or params[1].empty())
                         throw runtime_error{"desc parsing failed, expected <open>,<close>"};
 
                     select_and_set_last<mode>(
@@ -1090,12 +1119,17 @@ void copy_selections_on_next_lines(Context& context, NormalParams params)
     auto& buffer = context.buffer();
     const ColumnCount tabstop = context.options()["tabstop"].get<int>();
     Vector<Selection> result;
+    size_t main_index = 0;
     for (auto& sel : selections)
     {
+        const bool is_main = (&sel == &selections.main());
         auto anchor = sel.anchor();
         auto cursor = sel.cursor();
         ColumnCount cursor_col = get_column(buffer, tabstop, cursor);
         ColumnCount anchor_col = get_column(buffer, tabstop, anchor);
+
+        if (is_main)
+            main_index = result.size();
         result.push_back(std::move(sel));
         for (int i = 0; i < std::max(params.count, 1); ++i)
         {
@@ -1113,17 +1147,28 @@ void copy_selections_on_next_lines(Context& context, NormalParams params)
 
             if (anchor_byte != buffer[anchor_line].length() and
                 cursor_byte != buffer[cursor_line].length())
+            {
+                if (is_main)
+                    main_index = result.size();
                 result.emplace_back(BufferCoord{anchor_line, anchor_byte},
                                     BufferCoordAndTarget{cursor_line, cursor_byte, cursor.target});
+            }
         }
     }
-    selections = std::move(result);
+    selections.set(std::move(result), main_index);
     selections.sort_and_merge_overlapping();
 }
 
+template<Direction direction>
 void rotate_selections(Context& context, NormalParams params)
 {
-    context.selections().rotate_main(params.count != 0 ? params.count : 1);
+    const int count = params.count ? params.count : 1;
+    auto& selections = context.selections();
+    const int index = selections.main_index();
+    const int num = selections.size();
+    selections.set_main_index((direction == Forward) ?
+                                (index + count) % num
+                              : (index + (num - count % num)) % num);
 }
 
 void rotate_selections_content(Context& context, NormalParams params)
@@ -1140,8 +1185,10 @@ void rotate_selections_content(Context& context, NormalParams params)
         std::rotate(it, end-count, end);
         it = end;
     }
-    context.selections().insert(strings, InsertMode::Replace);
-    context.selections().rotate_main(count);
+    auto& selections = context.selections();
+    selections.insert(strings, InsertMode::Replace);
+    selections.set_main_index((selections.main_index() + count) %
+                              selections.size());
 }
 
 enum class SelectFlags
@@ -1348,8 +1395,8 @@ void tabs_to_spaces(Context& context, NormalParams params)
             {
                 ColumnCount col = get_column(buffer, opt_tabstop, it.coord());
                 ColumnCount end_col = (col / tabstop + 1) * tabstop;
-                tabs.push_back({ it.coord() });
-                spaces.push_back(String{ ' ', end_col - col });
+                tabs.emplace_back(it.coord());
+                spaces.emplace_back(' ', end_col - col);
             }
         }
     }
@@ -1380,9 +1427,9 @@ void spaces_to_tabs(Context& context, NormalParams params)
                     ++col;
                 }
                 if ((col % tabstop) == 0)
-                    spaces.push_back({spaces_beg.coord(), (spaces_end-1).coord()});
+                    spaces.emplace_back(spaces_beg.coord(), (spaces_end-1).coord());
                 else if (spaces_end != end and *spaces_end == '\t')
-                    spaces.push_back({spaces_beg.coord(), spaces_end.coord()});
+                    spaces.emplace_back(spaces_beg.coord(), spaces_end.coord());
                 it = spaces_end;
             }
             else
@@ -1416,6 +1463,9 @@ SelectionList read_selections_from_register(char reg, Context& context)
     Vector<Selection> sels;
     for (auto sel_desc : StringView{desc.begin(), arobase} | split<StringView>(':'))
         sels.push_back(selection_from_string(sel_desc));
+
+    if (sels.empty())
+        throw runtime_error(format("Register {} contains an empty selection list", reg));
 
     return {buffer, std::move(sels), timestamp};
 }
@@ -1805,8 +1855,9 @@ static NormalCmdDesc cmds[] =
     { ctrl('o'), "jump backward in jump list", jump<Backward> },
     { ctrl('s'), "push current selections in jump list", push_selections },
 
-    { '\'', "rotate main selection", rotate_selections },
-    { alt('\''), "rotate selections content", rotate_selections_content },
+    { '\'', "rotate main selection", rotate_selections<Forward> },
+    { alt('\''), "rotate main selection", rotate_selections<Backward> },
+    { alt('"'), "rotate selections content", rotate_selections_content },
 
     { 'q', "replay recorded macro", replay_macro },
     { 'Q', "start or end macro recording", start_or_end_macro_recording },

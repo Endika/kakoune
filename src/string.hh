@@ -8,7 +8,7 @@
 #include "utf8.hh"
 #include "vector.hh"
 
-#include <string.h>
+#include <cstring>
 #include <climits>
 
 namespace Kakoune
@@ -114,7 +114,7 @@ public:
     explicit String(Codepoint cp, ColumnCount count)
     {
         kak_assert(count % codepoint_width(cp) == 0);
-        int cp_count = (int)(count / codepoint_width(cp));
+        int cp_count = (int)(count / std::max(codepoint_width(cp), 1_col));
         reserve(utf8::codepoint_size(cp) * cp_count);
         while (cp_count-- > 0)
             utf8::dump(std::back_inserter(*this), cp);
@@ -211,7 +211,7 @@ private:
 class StringView : public StringOps<StringView, const char>
 {
 public:
-    constexpr StringView() = default;
+    StringView() = default;
     constexpr StringView(const char* data, ByteCount length)
         : m_data{data}, m_length{length} {}
     constexpr StringView(const char* data) : m_data{data}, m_length{data ? strlen(data) : 0} {}
@@ -248,9 +248,11 @@ public:
     ZeroTerminatedString zstr() const { return {begin(), end()}; }
 
 private:
-    const char* m_data = nullptr;
-    ByteCount m_length = 0;
+    const char* m_data;
+    ByteCount m_length;
 };
+
+static_assert(std::is_trivial<StringView>::value, "");
 
 template<typename Type, typename CharType>
 inline StringView StringOps<Type, CharType>::substr(ByteCount from, ByteCount length) const
@@ -330,12 +332,13 @@ String replace(StringView str, StringView substr, StringView replacement);
 template<typename Container>
 String join(const Container& container, char joiner, bool esc_joiner = true)
 {
+    const char to_escape[2] = { joiner, '\\' };
     String res;
     for (const auto& str : container)
     {
         if (not res.empty())
             res += joiner;
-        res += esc_joiner ? escape(str, joiner, '\\') : str;
+        res += esc_joiner ? escape(str, {to_escape, 2}, '\\') : str;
     }
     return res;
 }

@@ -249,7 +249,7 @@ void register_options()
                    Vector<String, MemoryDomain::Options>({ "./", "/usr/include" }));
     reg.declare_option("completers", "insert mode completers to execute.",
                        InsertCompleterDescList({
-                           InsertCompleterDesc{ InsertCompleterDesc::Filename },
+                           InsertCompleterDesc{ InsertCompleterDesc::Filename, {} },
                            InsertCompleterDesc{ InsertCompleterDesc::Word, "all"_str }
                        }), OptionFlags::None);
     reg.declare_option("static_words", "list of words to always consider for insert word completion",
@@ -272,10 +272,9 @@ void register_options()
                        "    ncurses_status_on_top         bool\n"
                        "    ncurses_set_title             bool\n"
                        "    ncurses_enable_mouse          bool\n"
+                       "    ncurses_change_colors         bool\n"
                        "    ncurses_wheel_up_button       int\n"
-                       "    ncurses_wheel_down_button     int\n"
-                       "    ncurses_buffer_padding_str    str\n"
-                       "    ncurses_buffer_padding_type   fill|single|off\n",
+                       "    ncurses_wheel_down_button     int\n",
                        UserInterface::Options{});
     reg.declare_option("modelinefmt", "format string used to generate the modeline",
                        "%val{bufname} %val{cursor_line}:%val{cursor_char_column} "_str);
@@ -385,7 +384,7 @@ std::unique_ptr<UserInterface> create_local_ui(UIType ui_type)
            });
         }
 
-        ~LocalUI()
+        ~LocalUI() override
         {
             set_signal_handler(SIGHUP, m_old_sighup);
             set_signal_handler(SIGTSTP, m_old_sigtstp);
@@ -455,25 +454,27 @@ void signal_handler(int signal)
         abort();
 }
 
-int run_client(StringView session, StringView init_cmds, UIType ui_type)
+int run_client(StringView session, StringView init_cmds,
+               Optional<BufferCoord> init_coord, UIType ui_type)
 {
     try
     {
         EventManager event_manager;
-        RemoteClient client{session, make_ui(ui_type), get_env_vars(), init_cmds};
+        RemoteClient client{session, make_ui(ui_type), get_env_vars(), init_cmds, init_coord};
         while (true)
             event_manager.handle_next_events(EventMode::Normal);
     }
-    catch (remote_error& e)
+    catch (disconnected& e)
     {
-        write_stderr(format("{}\ndisconnecting\n", e.what()));
-        return -1;
+        if (!e.m_graceful)
+            write_stderr(format("{}\ndisconnecting\n", e.what()));
+        return e.m_graceful ? 0 : -1;
     }
     return 0;
 }
 
 int run_server(StringView session,
-               StringView init_cmds, BufferCoord init_coord,
+               StringView init_cmds, Optional<BufferCoord> init_coord,
                bool ignore_kakrc, bool daemon, bool readonly, UIType ui_type,
                ConstArrayView<StringView> files)
 {
@@ -519,7 +520,7 @@ int run_server(StringView session,
 
     GlobalScope::instance().options().get_local_option("readonly").set(readonly);
 
-    Server server(session.empty() ? to_string(getpid()) : session.str());
+    Server server{session.empty() ? to_string(getpid()) : session.str()};
 
     bool startup_error = false;
     if (not ignore_kakrc) try
@@ -702,10 +703,10 @@ int run_pipe(StringView session)
     {
         send_command(session, command);
     }
-    catch (remote_error& e)
+    catch (disconnected& e)
     {
         write_stderr(format("{}\ndisconnecting\n", e.what()));
-        return -1;
+        return e.m_graceful ? 0 : -1;
     }
     return 0;
 }
@@ -733,7 +734,7 @@ int main(int argc, char* argv[])
 
     Vector<String> params;
     for (size_t i = 1; i < argc; ++i)
-        params.push_back(argv[i]);
+        params.emplace_back(argv[i]);
 
     const ParameterDesc param_desc{
         SwitchMap{ { "c", { true,  "connect to given session" } },
@@ -761,8 +762,10 @@ int main(int argc, char* argv[])
         const bool clear_sessions = (bool)parser.get_switch("clear");
         if (list_sessions or clear_sessions)
         {
-            StringView username = getpwuid(geteuid())->pw_name;
-            for (auto& session : list_files(format("/tmp/kakoune/{}/", username)))
+            const StringView username = getpwuid(geteuid())->pw_name;
+            const StringView tmp_dir = tmpdir();
+            for (auto& session : list_files(format("{}/kakoune/{}/", tmp_dir,
+                                                   username)))
             {
                 const bool valid = check_session(session);
                 if (list_sessions)
@@ -770,7 +773,8 @@ int main(int argc, char* argv[])
                 if (not valid and clear_sessions)
                 {
                     char socket_file[128];
-                    format_to(socket_file, "/tmp/kakoune/{}/{}", username, session);
+                    format_to(socket_file, "{}/kakoune/{}/{}", tmp_dir,
+                              username, session);
                     unlink(socket_file);
                 }
             }
@@ -809,6 +813,33 @@ int main(int argc, char* argv[])
                               (bool)parser.get_switch("q"));
         }
 
+        Vector<StringView> files;
+        Optional<BufferCoord> init_coord;
+        for (auto& name : parser)
+        {
+            if (not name.empty() and name[0_byte] == '+')
+            {
+                if (name == "+" or name  == "+:")
+                {
+                    init_cmds = init_cmds + "; exec gj";
+                    continue;
+                }
+                auto colon = find(name, ':');
+                if (auto line = str_to_int_ifp({name.begin()+1, colon}))
+                {
+                    init_coord = BufferCoord{
+                        *line - 1,
+                        colon != name.end() ?
+                            str_to_int_ifp({colon+1, name.end()}).value_or(1) - 1
+                          : 0
+                    };
+                    continue;
+                }
+            }
+
+            files.emplace_back(name);
+        }
+
         if (auto server_session = parser.get_switch("c"))
         {
             for (auto opt : { "n", "s", "d", "ro" })
@@ -820,32 +851,13 @@ int main(int argc, char* argv[])
                 }
             }
             String new_files;
-            for (auto name : parser)
+            for (auto name : files)
                 new_files += format("edit '{}';", escape(real_path(name), "'", '\\'));
 
-            return run_client(*server_session, new_files + init_cmds, ui_type);
+            return run_client(*server_session, new_files + init_cmds, init_coord, ui_type);
         }
         else
         {
-            BufferCoord init_coord;
-            Vector<StringView> files;
-            for (auto& name : parser)
-            {
-                if (not name.empty() and name[0_byte] == '+')
-                {
-                    auto colon = find(name, ':');
-                    if (auto line = str_to_int_ifp({name.begin()+1, colon}))
-                    {
-                        init_coord.line = *line - 1;
-                        if (colon != name.end())
-                            init_coord.column = str_to_int_ifp({colon+1, name.end()}).value_or(1) - 1;
-
-                        continue;
-                    }
-                }
-
-                files.emplace_back(name);
-            }
 
             StringView session = parser.get_switch("s").value_or(StringView{});
             try
@@ -861,7 +873,7 @@ int main(int argc, char* argv[])
                 raise(SIGTSTP);
                 return run_client(convert.session,
                                   format("try %^buffer '{}'; select '{}'^; echo converted to client only mode",
-                                         escape(convert.buffer_name, "'^", '\\'), convert.selections), ui_type);
+                                         escape(convert.buffer_name, "'^", '\\'), convert.selections), {}, ui_type);
             }
         }
     }
@@ -880,12 +892,12 @@ int main(int argc, char* argv[])
     }
     catch (Kakoune::exception& error)
     {
-        write_stderr(format("uncaught exception ({}):\n{}", typeid(error).name(), error.what()));
+        write_stderr(format("uncaught exception ({}):\n{}\n", typeid(error).name(), error.what()));
         return -1;
     }
     catch (std::exception& error)
     {
-        write_stderr(format("uncaught exception ({}):\n{}", typeid(error).name(), error.what()));
+        write_stderr(format("uncaught exception ({}):\n{}\n", typeid(error).name(), error.what()));
         return -1;
     }
     catch (...)

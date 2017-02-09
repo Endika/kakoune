@@ -28,7 +28,8 @@ enum class InfoStyle
     Inline,
     InlineAbove,
     InlineBelow,
-    MenuDoc
+    MenuDoc,
+    Modal
 };
 
 enum class EventMode;
@@ -38,7 +39,7 @@ using OnKeyCallback = std::function<void(Key key)>;
 class UserInterface
 {
 public:
-    virtual ~UserInterface() {}
+    virtual ~UserInterface() = default;
 
     virtual void menu_show(ConstArrayView<DisplayLine> choices,
                            DisplayCoord anchor, Face fg, Face bg,

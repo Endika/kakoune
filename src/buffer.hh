@@ -10,7 +10,7 @@
 #include "value.hh"
 #include "vector.hh"
 
-#include <time.h>
+#include <ctime>
 
 namespace Kakoune
 {
@@ -55,7 +55,9 @@ public:
     using difference_type = ssize_t;
     using pointer = const value_type*;
     using reference = const value_type&;
-    using iterator_category = std::random_access_iterator_tag;
+    // computing the distance between two iterator can be
+    // costly, so this is not strictly random access
+    using iterator_category = std::bidirectional_iterator_tag;
 
     BufferIterator() : m_buffer(nullptr) {}
     BufferIterator(const Buffer& buffer, BufferCoord coord);
@@ -118,7 +120,7 @@ public:
            timespec fs_timestamp = InvalidTime);
     Buffer(const Buffer&) = delete;
     Buffer& operator= (const Buffer&) = delete;
-    ~Buffer();
+    ~Buffer() override;
 
     Flags flags() const { return m_flags; }
     Flags& flags() { return m_flags; }
@@ -247,17 +249,17 @@ private:
     String m_display_name;
     Flags  m_flags;
 
-    using  UndoGroup = Vector<Modification, MemoryDomain::BufferMeta>;
+    using UndoGroup = Vector<Modification, MemoryDomain::BufferMeta>;
 
     struct HistoryNode : SafeCountable, UseMemoryDomain<MemoryDomain::BufferMeta>
     {
         HistoryNode(size_t id, HistoryNode* parent);
 
-        size_t id;
-        SafePtr<HistoryNode> parent;
         UndoGroup undo_group;
         Vector<std::unique_ptr<HistoryNode>, MemoryDomain::BufferMeta> childs;
+        SafePtr<HistoryNode> parent;
         SafePtr<HistoryNode> redo_child;
+        size_t id;
         TimePoint timepoint;
     };
 

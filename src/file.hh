@@ -24,6 +24,8 @@ String parse_filename(StringView filename);
 String real_path(StringView filename);
 String compact_path(StringView filename);
 
+StringView tmpdir();
+
 // returns pair { directory, filename }
 std::pair<StringView, StringView> split_path(StringView path);
 
@@ -56,7 +58,7 @@ bool file_exists(StringView filename);
 
 Vector<String> list_files(StringView directory);
 
-void make_directory(StringView dir);
+void make_directory(StringView dir, mode_t mode);
 
 timespec get_fs_timestamp(StringView filename);
 

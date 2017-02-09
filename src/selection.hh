@@ -28,6 +28,14 @@ struct Selection
     const BufferCoord& anchor() const { return m_anchor; }
     const BufferCoordAndTarget& cursor() const { return m_cursor; }
 
+    void set(BufferCoord anchor, BufferCoord cursor)
+    {
+        m_anchor = anchor;
+        m_cursor = cursor;
+    }
+
+    void set(BufferCoord coord) { set(coord, coord); }
+
     CaptureList& captures() { return m_captures; }
     const CaptureList& captures() const { return m_captures; }
 
@@ -89,8 +97,6 @@ struct SelectionList
     size_t main_index() const { return m_main; }
     void set_main_index(size_t main) { kak_assert(main < size()); m_main = main; }
 
-    void rotate_main(int count) { m_main = (m_main + count) % size(); }
-
     void avoid_eol();
 
     void push_back(const Selection& sel) { m_selections.push_back(sel); }
@@ -101,12 +107,19 @@ struct SelectionList
 
     SelectionList& operator=(Vector<Selection> list)
     {
+        const size_t main_index = list.size()-1;
+        set(std::move(list), main_index);
+        return *this;
+    }
+
+    void set(Vector<Selection> list, size_t main)
+    {
+        kak_assert(main < list.size());
         m_selections = std::move(list);
-        m_main = size()-1;
+        m_main = main;
         sort_and_merge_overlapping();
         update_timestamp();
         check_invariant();
-        return *this;
     }
 
     using iterator = Vector<Selection>::iterator;
@@ -135,7 +148,7 @@ struct SelectionList
     void update_timestamp() { m_timestamp = m_buffer->timestamp(); }
 
     void insert(ConstArrayView<String> strings, InsertMode mode,
-                bool select_inserted = false);
+                Vector<BufferCoord>* out_insert_pos = nullptr);
     void erase();
 
 private:

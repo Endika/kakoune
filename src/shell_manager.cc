@@ -13,7 +13,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <stdlib.h>
+#include <fcntl.h>
+#include <cstdlib>
 
 extern char **environ;
 
@@ -22,9 +23,38 @@ namespace Kakoune
 
 ShellManager::ShellManager()
 {
-    const char* path = getenv("PATH");
-    auto new_path = format("{}:{}", path, split_path(get_kak_binary_path()).first);
-    setenv("PATH", new_path.c_str(), 1);
+    // Get a guaranteed to be POSIX shell binary
+    {
+        auto size = confstr(_CS_PATH, nullptr, 0);
+        String path; path.resize(size-1, 0);
+        confstr(_CS_PATH, path.data(), size);
+        for (auto dir : StringView{path} | split<StringView>(':'))
+        {
+            String candidate = format("{}/sh", dir);
+            struct stat st;
+            if (stat(candidate.c_str(), &st))
+                continue;
+
+            bool executable = (st.st_mode & S_IXUSR)
+                            | (st.st_mode & S_IXGRP)
+                            | (st.st_mode & S_IXOTH);
+            if (S_ISREG(st.st_mode) and executable)
+            {
+                m_shell = std::move(candidate);
+                break;
+            }
+        }
+        if (m_shell.empty())
+            throw runtime_error{format("unable to find a posix shell in {}", path)};
+    }
+
+    // Add Kakoune binary location to the path to guarantee that %sh{ ... }
+    // have access to the kak command regardless of if the user installed it
+    {
+        const char* path = getenv("PATH");
+        auto new_path = format("{}:{}", path, split_path(get_kak_binary_path()).first);
+        setenv("PATH", new_path.c_str(), 1);
+    }
 }
 
 namespace
@@ -52,8 +82,10 @@ private:
 };
 
 template<typename Func>
-pid_t spawn_shell(StringView cmdline, ConstArrayView<String> params,
-                  ConstArrayView<String> kak_env, Func setup_child)
+pid_t spawn_shell(const char* shell, StringView cmdline,
+                  ConstArrayView<String> params,
+                  ConstArrayView<String> kak_env,
+                  Func setup_child)
 {
     Vector<const char*> envptrs;
     for (char** envp = environ; *envp; ++envp)
@@ -62,7 +94,6 @@ pid_t spawn_shell(StringView cmdline, ConstArrayView<String> params,
         envptrs.push_back(env.c_str());
     envptrs.push_back(nullptr);
 
-    const char* shell = "/bin/sh";
     auto cmdlinezstr = cmdline.zstr();
     Vector<const char*> execparams = { shell, "-c", cmdlinezstr };
     if (not params.empty())
@@ -129,7 +160,7 @@ std::pair<String, int> ShellManager::eval(
     auto spawn_time = profile ? Clock::now() : Clock::time_point{};
 
     Pipe child_stdin{not input.empty()}, child_stdout, child_stderr;
-    pid_t pid = spawn_shell(cmdline, shell_context.params, kak_env,
+    pid_t pid = spawn_shell(m_shell.c_str(), cmdline, shell_context.params, kak_env,
                             [&child_stdin, &child_stdout, &child_stderr] {
         auto move = [](int oldfd, int newfd) { dup2(oldfd, newfd); close(oldfd); };
 
@@ -149,9 +180,6 @@ std::pair<String, int> ShellManager::eval(
     child_stdin.close_read_fd();
     child_stdout.close_write_fd();
     child_stderr.close_write_fd();
-
-    write(child_stdin.write_fd(), input);
-    child_stdin.close_write_fd();
 
     auto wait_time = Clock::now();
 
@@ -176,9 +204,37 @@ std::pair<String, int> ShellManager::eval(
         {}
     };
 
+    struct PipeWriter : FDWatcher
+    {
+        PipeWriter(Pipe& pipe, StringView contents)
+            : FDWatcher(pipe.write_fd(), FdEvents::Write,
+                        [contents, &pipe](FDWatcher& watcher, FdEvents, EventMode) mutable {
+                            while (fd_writable(pipe.write_fd()))
+                            {
+                                ssize_t size = ::write(pipe.write_fd(), contents.begin(),
+                                                       (size_t)contents.length());
+                                if (size > 0)
+                                    contents = contents.substr(ByteCount{(int)size});
+                                if (size == -1 and (errno == EAGAIN or errno == EWOULDBLOCK))
+                                    return;
+                                if (size < 0 or contents.empty())
+                                {
+                                    pipe.close_write_fd();
+                                    watcher.disable();
+                                    return;
+                                }
+                            }
+                        })
+        {
+            int flags = fcntl(pipe.write_fd(), F_GETFL, 0);
+            fcntl(pipe.write_fd(), F_SETFL, flags | O_NONBLOCK);
+        }
+    };
+
     String stdout_contents, stderr_contents;
     PipeReader stdout_reader{child_stdout, stdout_contents};
     PipeReader stderr_reader{child_stderr, stderr_contents};
+    PipeWriter stdin_writer{child_stdin, input};
 
     // block SIGCHLD to make sure we wont receive it before
     // our call to pselect, that will end up blocking indefinitly.
@@ -205,7 +261,7 @@ std::pair<String, int> ShellManager::eval(
         wait_notified = true;
     }, EventMode::Urgent};
 
-    while (not terminated or
+    while (not terminated or child_stdin.write_fd() != -1 or
            ((flags & Flags::WaitForStdout) and
             (child_stdout.read_fd() != -1 or child_stderr.read_fd() != -1)))
     {

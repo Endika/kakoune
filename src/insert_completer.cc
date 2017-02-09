@@ -14,6 +14,7 @@
 #include "user_interface.hh"
 
 #include <numeric>
+#include <utility>
 
 namespace Kakoune
 {
@@ -113,8 +114,8 @@ InsertCompletion complete_word(const SelectionList& sels, const OptionManager& o
 
     struct RankedMatchAndBuffer : RankedMatch
     {
-        RankedMatchAndBuffer(const RankedMatch& m, const Buffer* b)
-            : RankedMatch{m}, buffer{b} {}
+        RankedMatchAndBuffer(RankedMatch  m, const Buffer* b)
+            : RankedMatch{std::move(m)}, buffer{b} {}
 
         using RankedMatch::operator==;
         using RankedMatch::operator<;
@@ -400,11 +401,11 @@ void InsertCompleter::select(int offset, Vector<Key>& keystrokes)
     }
 
     for (auto i = 0_byte; i < prefix_len; ++i)
-        keystrokes.push_back(Key::Backspace);
+        keystrokes.emplace_back(Key::Backspace);
     for (auto i = 0_byte; i < suffix_len; ++i)
-        keystrokes.push_back(Key::Delete);
+        keystrokes.emplace_back(Key::Delete);
     for (auto& c : candidate.completion)
-        keystrokes.push_back(c);
+        keystrokes.emplace_back(c);
 }
 
 void InsertCompleter::update()
@@ -418,9 +419,9 @@ void InsertCompleter::update()
 
 void InsertCompleter::reset()
 {
-    m_explicit_completer = nullptr;
-    if (m_completions.is_valid())
+    if (m_explicit_completer or m_completions.is_valid())
     {
+        m_explicit_completer = nullptr;
         m_completions = InsertCompletion{};
         if (m_context.has_client())
         {
@@ -515,7 +516,7 @@ bool InsertCompleter::try_complete(Func complete_func)
     kak_assert(m_completions.begin <= sels.main().cursor());
     m_current_candidate = m_completions.candidates.size();
     menu_show();
-    m_completions.candidates.push_back({sels.buffer().string(m_completions.begin, m_completions.end), ""});
+    m_completions.candidates.push_back({sels.buffer().string(m_completions.begin, m_completions.end), "", {}});
     return true;
 }
 

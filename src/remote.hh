@@ -11,13 +11,19 @@
 namespace Kakoune
 {
 
-struct remote_error : runtime_error
+struct disconnected : runtime_error
 {
-    using runtime_error::runtime_error;
+    disconnected(String what, bool graceful = false)
+      : runtime_error{std::move(what)}, m_graceful{graceful} {}
+
+    const bool m_graceful;
 };
 
 class FDWatcher;
 class UserInterface;
+
+template<typename T> struct Optional;
+struct BufferCoord;
 
 using RemoteBuffer = Vector<char, MemoryDomain::Remote>;
 
@@ -27,7 +33,8 @@ class RemoteClient
 {
 public:
     RemoteClient(StringView session, std::unique_ptr<UserInterface>&& ui,
-                 const EnvVarMap& env_vars, StringView init_command);
+                 const EnvVarMap& env_vars, StringView init_command,
+                 Optional<BufferCoord> init_coord);
 
 private:
     std::unique_ptr<UserInterface> m_ui;
